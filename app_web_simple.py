@@ -4,7 +4,7 @@ Simplified Web Viewer - loads full image instead of tiles for debugging
 """
 
 from flask import Flask, render_template_string, jsonify, send_file, request, redirect, session
-from functools import wraps
+from functools import wraps, lru_cache
 import numpy as np
 import zarr
 import json
@@ -43,8 +43,11 @@ def require_password(f):
         return render_template_string(LOGIN_TEMPLATE)
     return decorated_function
 
-# load full image once
+# cached data - load once and reuse
 FULL_IMAGE = None
+ZARR_DATA = None
+SEGMENTATION = None
+SEGMENTATION_DENSE = None
 
 def get_full_image():
     global FULL_IMAGE
@@ -52,27 +55,49 @@ def get_full_image():
         if not IMAGE_PATH.exists():
             raise FileNotFoundError(f"Image file not found at {IMAGE_PATH}")
         from tifffile import imread
+        print(f"Loading full image from {IMAGE_PATH}...")
         img = imread(IMAGE_PATH)
         # downscale to half for web viewing
         pil_img = Image.fromarray(img)
         new_size = (pil_img.width // 2, pil_img.height // 2)
         pil_img = pil_img.resize(new_size, Image.LANCZOS)
         FULL_IMAGE = np.array(pil_img)
+        print(f"Full image loaded and cached: {FULL_IMAGE.shape}")
     return FULL_IMAGE
 
 def load_zarr_expression():
-    """load zarr expression data"""
-    zarr_path = TILES_DIR / 'expression.zarr'
-    return zarr.open(str(zarr_path), mode='r')
+    """load zarr expression data (cached)"""
+    global ZARR_DATA
+    if ZARR_DATA is None:
+        zarr_path = TILES_DIR / 'expression.zarr'
+        print(f"Loading zarr data from {zarr_path}...")
+        ZARR_DATA = zarr.open(str(zarr_path), mode='r')
+        print(f"Zarr data loaded and cached")
+    return ZARR_DATA
 
 def load_segmentation():
-    """load segmentation mask"""
-    seg_path = TILES_DIR / 'segmentation.npz'
-    data = np.load(seg_path)
-    return csr_matrix(
-        (data['data'], data['indices'], data['indptr']),
-        shape=tuple(data['shape'])
-    )
+    """load segmentation mask (cached)"""
+    global SEGMENTATION
+    if SEGMENTATION is None:
+        seg_path = TILES_DIR / 'segmentation.npz'
+        print(f"Loading segmentation from {seg_path}...")
+        data = np.load(seg_path)
+        SEGMENTATION = csr_matrix(
+            (data['data'], data['indices'], data['indptr']),
+            shape=tuple(data['shape'])
+        )
+        print(f"Segmentation loaded and cached: {SEGMENTATION.shape}")
+    return SEGMENTATION
+
+def get_segmentation_dense():
+    """get dense segmentation array (cached)"""
+    global SEGMENTATION_DENSE
+    if SEGMENTATION_DENSE is None:
+        seg = load_segmentation()
+        print(f"Converting segmentation to dense array...")
+        SEGMENTATION_DENSE = seg.toarray()
+        print(f"Dense segmentation cached: {SEGMENTATION_DENSE.shape}")
+    return SEGMENTATION_DENSE
 
 LOGIN_TEMPLATE = '''
 <!DOCTYPE html>
@@ -622,79 +647,100 @@ def get_expression(gene):
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+# cache for generated overlays (LRU cache - keeps last 20 genes)
+from functools import lru_cache as _lru_cache
+OVERLAY_CACHE = {}
+MAX_CACHE_SIZE = 20
+
+def generate_expression_overlay(gene):
+    """generate expression overlay image (cached)"""
+    # check cache first
+    if gene in OVERLAY_CACHE:
+        print(f"Using cached overlay for {gene}")
+        return OVERLAY_CACHE[gene]
+
+    print(f"\n=== Creating expression overlay for {gene} ===")
+
+    zdata = load_zarr_expression()
+    seg_dense = get_segmentation_dense()  # use cached dense segmentation
+    print(f"Loaded zarr and dense segmentation")
+
+    var_names = zdata['var_names'][:]
+    obs_names = zdata['obs_names'][:]
+
+    gene_idx = np.where(var_names == gene)[0]
+    if len(gene_idx) == 0:
+        print(f"Gene {gene} not found")
+        return None
+
+    expr = zdata['X'][:, gene_idx[0]]
+    print(f"Expression values: min={expr.min()}, max={expr.max()}, n_expressing={np.sum(expr > 0)}")
+
+    print(f"Mapping expression to cells (vectorized)...")
+
+    # create a lookup array: cell_id -> expression value
+    max_cell_id = int(seg_dense.max())
+    lookup = np.zeros(max_cell_id + 1, dtype=np.float32)
+
+    # fill lookup table with expression values
+    cell_ids = obs_names.astype(int)
+    valid_mask = cell_ids <= max_cell_id
+    lookup[cell_ids[valid_mask]] = expr[valid_mask]
+
+    # vectorized mapping: use segmentation as index into lookup table
+    expr_map = lookup[seg_dense]
+
+    print(f"Expression map: min={expr_map.min()}, max={expr_map.max()}, n_nonzero={np.sum(expr_map > 0)}")
+
+    # normalize and create image
+    if np.max(expr_map) > 0:
+        vmax = np.percentile(expr_map[expr_map > 0], 99)
+        expr_norm = np.clip(expr_map / vmax * 255, 0, 255).astype(np.uint8)
+        print(f"Normalized to vmax={vmax}, expr_norm range: {expr_norm.min()}-{expr_norm.max()}")
+    else:
+        expr_norm = expr_map.astype(np.uint8)
+        print("No expression found, creating empty overlay")
+
+    # apply colormap
+    from matplotlib import cm
+    cmap = cm.get_cmap('viridis')
+    expr_rgba = cmap(expr_norm)
+    expr_rgba[..., 3] = np.where(expr_norm > 0, 1.0, 0)  # alpha channel
+    print(f"Applied viridis colormap, RGBA shape: {expr_rgba.shape}")
+
+    # convert to image
+    img = Image.fromarray((expr_rgba * 255).astype(np.uint8), mode='RGBA')
+    print(f"Created PIL image: {img.size}")
+
+    # downscale to match the displayed image
+    new_size = (img.width // 2, img.height // 2)
+    img = img.resize(new_size, Image.LANCZOS)
+    print(f"Resized to: {img.size}")
+
+    # save to bytes
+    buf = io.BytesIO()
+    img.save(buf, format='PNG')
+    buf.seek(0)
+    png_bytes = buf.read()
+    print(f"Saved PNG, size: {len(png_bytes)} bytes")
+
+    # cache it (with size limit)
+    if len(OVERLAY_CACHE) >= MAX_CACHE_SIZE:
+        # remove oldest entry
+        OVERLAY_CACHE.pop(next(iter(OVERLAY_CACHE)))
+    OVERLAY_CACHE[gene] = png_bytes
+
+    return png_bytes
+
 @app.route('/api/expression_overlay/<gene>', methods=['GET', 'POST'])
 @require_password
 def get_expression_overlay(gene):
     try:
-        print(f"\n=== Creating expression overlay for {gene} ===")
-
-        zdata = load_zarr_expression()
-        seg = load_segmentation()
-        print(f"Loaded zarr and segmentation")
-
-        var_names = zdata['var_names'][:]
-        obs_names = zdata['obs_names'][:]
-
-        gene_idx = np.where(var_names == gene)[0]
-        if len(gene_idx) == 0:
-            print(f"Gene {gene} not found")
+        png_bytes = generate_expression_overlay(gene)
+        if png_bytes is None:
             return jsonify({'error': f'gene {gene} not found'}), 404
 
-        expr = zdata['X'][:, gene_idx[0]]
-        print(f"Expression values: min={expr.min()}, max={expr.max()}, n_expressing={np.sum(expr > 0)}")
-
-        # create expression map
-        print(f"Converting segmentation to dense...")
-        seg_dense = seg.toarray()
-        print(f"Segmentation shape: {seg_dense.shape}")
-
-        print(f"Mapping expression to cells (vectorized)...")
-
-        # Create a lookup array: cell_id -> expression value
-        # This is MUCH faster than looping through 105k cells
-        max_cell_id = int(seg_dense.max())
-        lookup = np.zeros(max_cell_id + 1, dtype=np.float32)
-
-        # Fill lookup table with expression values
-        cell_ids = obs_names.astype(int)
-        valid_mask = cell_ids <= max_cell_id
-        lookup[cell_ids[valid_mask]] = expr[valid_mask]
-
-        # Vectorized mapping: use segmentation as index into lookup table
-        expr_map = lookup[seg_dense]
-
-        print(f"Expression map: min={expr_map.min()}, max={expr_map.max()}, n_nonzero={np.sum(expr_map > 0)}")
-
-        # normalize and create image
-        if np.max(expr_map) > 0:
-            vmax = np.percentile(expr_map[expr_map > 0], 99)
-            expr_norm = np.clip(expr_map / vmax * 255, 0, 255).astype(np.uint8)
-            print(f"Normalized to vmax={vmax}, expr_norm range: {expr_norm.min()}-{expr_norm.max()}")
-        else:
-            expr_norm = expr_map.astype(np.uint8)
-            print("No expression found, creating empty overlay")
-
-        # apply colormap
-        from matplotlib import cm
-        cmap = cm.get_cmap('viridis')
-        expr_rgba = cmap(expr_norm)
-        expr_rgba[..., 3] = np.where(expr_norm > 0, 1.0, 0)  # alpha channel (1.0 = 100% opacity)
-        print(f"Applied viridis colormap, RGBA shape: {expr_rgba.shape}")
-
-        # convert to image
-        img = Image.fromarray((expr_rgba * 255).astype(np.uint8), mode='RGBA')
-        print(f"Created PIL image: {img.size}")
-
-        # downscale to match the displayed image
-        new_size = (img.width // 2, img.height // 2)
-        img = img.resize(new_size, Image.LANCZOS)
-        print(f"Resized to: {img.size}")
-
-        buf = io.BytesIO()
-        img.save(buf, format='PNG')
-        buf.seek(0)
-        print(f"Saved PNG, size: {buf.getbuffer().nbytes} bytes")
-
+        buf = io.BytesIO(png_bytes)
         return send_file(buf, mimetype='image/png')
 
     except Exception as e:
@@ -703,52 +749,64 @@ def get_expression_overlay(gene):
         print(traceback.format_exc())
         return jsonify({'error': str(e)}), 500
 
+# cache for cell boundaries
+BOUNDARY_CACHE = None
+
+def generate_cell_boundaries():
+    """generate cell boundary overlay image (cached)"""
+    global BOUNDARY_CACHE
+
+    if BOUNDARY_CACHE is not None:
+        print("Using cached cell boundaries")
+        return BOUNDARY_CACHE
+
+    print("\n=== Creating cell boundaries ===")
+
+    seg_dense = get_segmentation_dense()  # use cached dense segmentation
+    print(f"Loaded dense segmentation: {seg_dense.shape}")
+
+    # find boundaries using edge detection
+    print(f"Detecting cell boundaries...")
+    from scipy import ndimage
+
+    # use sobel edge detection
+    edges_y = ndimage.sobel(seg_dense.astype(float), axis=0)
+    edges_x = ndimage.sobel(seg_dense.astype(float), axis=1)
+    edges = np.hypot(edges_x, edges_y)
+
+    # threshold to get clean boundaries
+    edges = (edges > 0).astype(np.uint8) * 255
+    print(f"Found {np.sum(edges > 0)} boundary pixels")
+
+    # create RGBA image (yellow boundaries, transparent background)
+    boundary_rgba = np.zeros((*edges.shape, 4), dtype=np.uint8)
+    boundary_rgba[edges > 0] = [255, 255, 0, 255]  # yellow boundaries
+
+    # convert to PIL image
+    img = Image.fromarray(boundary_rgba, mode='RGBA')
+    print(f"Created boundary image: {img.size}")
+
+    # downscale to match displayed image
+    new_size = (img.width // 2, img.height // 2)
+    img = img.resize(new_size, Image.LANCZOS)
+    print(f"Resized to: {img.size}")
+
+    # save to bytes and cache
+    buf = io.BytesIO()
+    img.save(buf, format='PNG')
+    buf.seek(0)
+    BOUNDARY_CACHE = buf.read()
+    print(f"Saved PNG, size: {len(BOUNDARY_CACHE)} bytes")
+
+    return BOUNDARY_CACHE
+
 @app.route('/api/cell_boundaries', methods=['GET', 'POST'])
 @require_password
 def get_cell_boundaries():
     """Generate cell boundary overlay image"""
     try:
-        print("\n=== Creating cell boundaries ===")
-
-        seg = load_segmentation()
-        print(f"Loaded segmentation")
-
-        # convert to dense
-        print(f"Converting to dense...")
-        seg_dense = seg.toarray()
-        print(f"Segmentation shape: {seg_dense.shape}")
-
-        # find boundaries using edge detection
-        print(f"Detecting cell boundaries...")
-        from scipy import ndimage
-
-        # use sobel edge detection
-        edges_y = ndimage.sobel(seg_dense.astype(float), axis=0)
-        edges_x = ndimage.sobel(seg_dense.astype(float), axis=1)
-        edges = np.hypot(edges_x, edges_y)
-
-        # threshold to get clean boundaries
-        edges = (edges > 0).astype(np.uint8) * 255
-        print(f"Found {np.sum(edges > 0)} boundary pixels")
-
-        # create RGBA image (yellow boundaries, transparent background)
-        boundary_rgba = np.zeros((*edges.shape, 4), dtype=np.uint8)
-        boundary_rgba[edges > 0] = [255, 255, 0, 255]  # yellow boundaries (R=255, G=255, B=0)
-
-        # convert to PIL image
-        img = Image.fromarray(boundary_rgba, mode='RGBA')
-        print(f"Created boundary image: {img.size}")
-
-        # downscale to match displayed image
-        new_size = (img.width // 2, img.height // 2)
-        img = img.resize(new_size, Image.LANCZOS)
-        print(f"Resized to: {img.size}")
-
-        buf = io.BytesIO()
-        img.save(buf, format='PNG')
-        buf.seek(0)
-        print(f"Saved PNG, size: {buf.getbuffer().nbytes} bytes")
-
+        png_bytes = generate_cell_boundaries()
+        buf = io.BytesIO(png_bytes)
         return send_file(buf, mimetype='image/png')
 
     except Exception as e:
