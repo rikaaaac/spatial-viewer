@@ -488,12 +488,12 @@ HTML_TEMPLATE = '''
 </html>
 '''
 
-@app.route('/')
+@app.route('/', methods=['GET', 'POST'])
 @require_password
 def index():
     return render_template_string(HTML_TEMPLATE)
 
-@app.route('/upload')
+@app.route('/upload', methods=['GET', 'POST'])
 @require_password
 def upload_page():
     """upload page for data files"""
@@ -572,21 +572,21 @@ def upload_zarr():
     except Exception as e:
         return f'Error uploading Zarr: {str(e)}', 500
 
-@app.route('/api/metadata')
+@app.route('/api/metadata', methods=['GET', 'POST'])
 @require_password
 def get_metadata():
     with open(TILES_DIR / 'gene_index.json') as f:
         gene_meta = json.load(f)
     return jsonify({'genes': gene_meta})
 
-@app.route('/api/genes')
+@app.route('/api/genes', methods=['GET', 'POST'])
 @require_password
 def get_genes():
     with open(TILES_DIR / 'gene_index.json') as f:
         data = json.load(f)
     return jsonify(data['genes'])
 
-@app.route('/api/full_image')
+@app.route('/api/full_image', methods=['GET', 'POST'])
 @require_password
 def get_full_image_endpoint():
     img = get_full_image()
@@ -596,7 +596,7 @@ def get_full_image_endpoint():
     buf.seek(0)
     return send_file(buf, mimetype='image/jpeg')
 
-@app.route('/api/expression/<gene>')
+@app.route('/api/expression/<gene>', methods=['GET', 'POST'])
 @require_password
 def get_expression(gene):
     try:
@@ -622,7 +622,7 @@ def get_expression(gene):
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/expression_overlay/<gene>')
+@app.route('/api/expression_overlay/<gene>', methods=['GET', 'POST'])
 @require_password
 def get_expression_overlay(gene):
     try:
@@ -703,7 +703,7 @@ def get_expression_overlay(gene):
         print(traceback.format_exc())
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/cell_boundaries')
+@app.route('/api/cell_boundaries', methods=['GET', 'POST'])
 @require_password
 def get_cell_boundaries():
     """Generate cell boundary overlay image"""
