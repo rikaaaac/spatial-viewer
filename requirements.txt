@@ -8,3 +8,4 @@ matplotlib>=3.8.0
 zarr<3.0.0
 numcodecs>=0.12.0
 tifffile>=2023.7.0
+imagecodecs>=2023.9.0
