@@ -43,11 +43,10 @@ def require_password(f):
         return render_template_string(LOGIN_TEMPLATE)
     return decorated_function
 
-# cached data - load once and reuse
+# cached data - load once and reuse (but NOT dense segmentation - too big!)
 FULL_IMAGE = None
 ZARR_DATA = None
 SEGMENTATION = None
-SEGMENTATION_DENSE = None
 
 def get_full_image():
     global FULL_IMAGE
@@ -76,7 +75,7 @@ def load_zarr_expression():
     return ZARR_DATA
 
 def load_segmentation():
-    """load segmentation mask (cached)"""
+    """load segmentation mask (cached as sparse matrix)"""
     global SEGMENTATION
     if SEGMENTATION is None:
         seg_path = TILES_DIR / 'segmentation.npz'
@@ -88,16 +87,6 @@ def load_segmentation():
         )
         print(f"Segmentation loaded and cached: {SEGMENTATION.shape}")
     return SEGMENTATION
-
-def get_segmentation_dense():
-    """get dense segmentation array (cached)"""
-    global SEGMENTATION_DENSE
-    if SEGMENTATION_DENSE is None:
-        seg = load_segmentation()
-        print(f"Converting segmentation to dense array...")
-        SEGMENTATION_DENSE = seg.toarray()
-        print(f"Dense segmentation cached: {SEGMENTATION_DENSE.shape}")
-    return SEGMENTATION_DENSE
 
 LOGIN_TEMPLATE = '''
 <!DOCTYPE html>
@@ -647,10 +636,10 @@ def get_expression(gene):
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# cache for generated overlays (LRU cache - keeps last 20 genes)
+# cache for generated overlays (keeps last 10 genes to conserve memory)
 from functools import lru_cache as _lru_cache
 OVERLAY_CACHE = {}
-MAX_CACHE_SIZE = 20
+MAX_CACHE_SIZE = 10
 
 def generate_expression_overlay(gene):
     """generate expression overlay image (cached)"""
@@ -662,8 +651,10 @@ def generate_expression_overlay(gene):
     print(f"\n=== Creating expression overlay for {gene} ===")
 
     zdata = load_zarr_expression()
-    seg_dense = get_segmentation_dense()  # use cached dense segmentation
-    print(f"Loaded zarr and dense segmentation")
+    seg = load_segmentation()
+    print(f"Converting segmentation to dense...")
+    seg_dense = seg.toarray()
+    print(f"Loaded zarr and converted segmentation to dense: {seg_dense.shape}")
 
     var_names = zdata['var_names'][:]
     obs_names = zdata['obs_names'][:]
@@ -730,6 +721,9 @@ def generate_expression_overlay(gene):
         OVERLAY_CACHE.pop(next(iter(OVERLAY_CACHE)))
     OVERLAY_CACHE[gene] = png_bytes
 
+    # cleanup temp arrays to free memory
+    del seg_dense, lookup, expr_map, expr_norm, expr_rgba, img
+
     return png_bytes
 
 @app.route('/api/expression_overlay/<gene>', methods=['GET', 'POST'])
@@ -762,8 +756,10 @@ def generate_cell_boundaries():
 
     print("\n=== Creating cell boundaries ===")
 
-    seg_dense = get_segmentation_dense()  # use cached dense segmentation
-    print(f"Loaded dense segmentation: {seg_dense.shape}")
+    seg = load_segmentation()
+    print(f"Converting segmentation to dense...")
+    seg_dense = seg.toarray()
+    print(f"Converted to dense: {seg_dense.shape}")
 
     # find boundaries using edge detection
     print(f"Detecting cell boundaries...")
@@ -797,6 +793,9 @@ def generate_cell_boundaries():
     buf.seek(0)
     BOUNDARY_CACHE = buf.read()
     print(f"Saved PNG, size: {len(BOUNDARY_CACHE)} bytes")
+
+    # cleanup temp arrays to free memory
+    del seg_dense, edges, edges_x, edges_y, boundary_rgba, img
 
     return BOUNDARY_CACHE
 
